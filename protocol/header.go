@@ -12,6 +12,7 @@ type Header struct {
 	Password     string
 	IsClient     bool
 	Flags        Flags
+	UtlsImitate  string // uTLS client hello fingerprint (e.g. "chrome", "firefox")
 }
 
 type Flags uint64
