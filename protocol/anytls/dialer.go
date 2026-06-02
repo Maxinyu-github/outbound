@@ -4,13 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
@@ -79,17 +83,28 @@ func init() {
 }
 
 type Dialer struct {
-	proxyAddress string
-	nextDialer   netproxy.Dialer
-	metadata     protocol.Metadata
-	key          []byte
-	tlsConfig    *tls.Config
-	utlsImitate  string
+	proxyAddress          string
+	nextDialer            netproxy.Dialer
+	metadata              protocol.Metadata
+	key                   []byte
+	tlsConfig             *tls.Config
+	utlsImitate           string
+	serverCertFingerprint string
+	idleCheckInterval     time.Duration
+	idleTimeout           time.Duration
+	minIdleSession        int
 
 	sessionCounter atomic.Uint64
 
 	idleSessionLock sync.Mutex
-	idleSessions    map[uint64]*session
+	idleSessions    map[uint64]*idleSessionEntry
+
+	closed chan struct{}
+}
+
+type idleSessionEntry struct {
+	session  *session
+	idleSince time.Time
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -97,15 +112,34 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		IsClient: header.IsClient,
 	}
 	sum := sha256.Sum256([]byte(header.Password))
-	return &Dialer{
-		proxyAddress: header.ProxyAddress,
-		nextDialer:   nextDialer,
-		metadata:     metadata,
-		key:          sum[:],
-		tlsConfig:    header.TlsConfig,
-		utlsImitate:  header.UtlsImitate,
-		idleSessions: make(map[uint64]*session),
-	}, nil
+
+	idleCheckInterval := header.IdleSessionCheckInterval
+	if idleCheckInterval <= 0 {
+		idleCheckInterval = 30 * time.Second
+	}
+	idleTimeout := header.IdleSessionTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 30 * time.Second
+	}
+
+	d := &Dialer{
+		proxyAddress:          header.ProxyAddress,
+		nextDialer:            nextDialer,
+		metadata:              metadata,
+		key:                   sum[:],
+		tlsConfig:             header.TlsConfig,
+		utlsImitate:           header.UtlsImitate,
+		serverCertFingerprint: strings.ToLower(strings.ReplaceAll(header.ServerCertFingerprint, ":", "")),
+		idleCheckInterval:     idleCheckInterval,
+		idleTimeout:           idleTimeout,
+		minIdleSession:        header.MinIdleSession,
+		idleSessions:          make(map[uint64]*idleSessionEntry),
+		closed:                make(chan struct{}),
+	}
+
+	go d.idleSessionManager()
+
+	return d, nil
 }
 
 func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
@@ -158,16 +192,20 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, error) {
 	d.idleSessionLock.Lock()
 	for seq := range d.idleSessions {
-		s := d.idleSessions[seq]
+		entry := d.idleSessions[seq]
 		delete(d.idleSessions, seq)
-		if s.closed.Load() {
+		if entry.session.closed.Load() {
 			continue
 		}
 		d.idleSessionLock.Unlock()
-		return s, nil
+		return entry.session, nil
 	}
 	d.idleSessionLock.Unlock()
 
+	return d.createSession(ctx, tcpNetwork)
+}
+
+func (d *Dialer) createSession(ctx context.Context, tcpNetwork string) (*session, error) {
 	rawConn, err := d.nextDialer.DialContext(ctx, tcpNetwork, d.proxyAddress)
 	if err != nil {
 		return nil, err
@@ -191,12 +229,26 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 			uConn.Close()
 			return nil, err
 		}
+		// Verify server certificate fingerprint for uTLS connections
+		if d.serverCertFingerprint != "" {
+			if err := d.verifyServerCertFingerprint(uConn.ConnectionState().PeerCertificates); err != nil {
+				uConn.Close()
+				return nil, err
+			}
+		}
 		tlsConn = uConn
 	} else {
 		stdConn := tls.Client(conn, d.tlsConfig)
 		if err := stdConn.Handshake(); err != nil {
 			stdConn.Close()
 			return nil, err
+		}
+		// Verify server certificate fingerprint for standard TLS connections
+		if d.serverCertFingerprint != "" {
+			if err := d.verifyServerCertFingerprint(stdConn.ConnectionState().PeerCertificates); err != nil {
+				stdConn.Close()
+				return nil, err
+			}
 		}
 		tlsConn = stdConn
 	}
@@ -219,7 +271,10 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 			}
 			d.idleSessionLock.Lock()
 			if _, ok := d.idleSessions[seq]; !ok {
-				d.idleSessions[seq] = s
+				d.idleSessions[seq] = &idleSessionEntry{
+					session:   s,
+					idleSince: time.Now(),
+				}
 			}
 			d.idleSessionLock.Unlock()
 		}
@@ -228,4 +283,59 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 	go s.run()
 
 	return s, nil
+}
+
+func (d *Dialer) verifyServerCertFingerprint(certs []*x509.Certificate) error {
+	if len(certs) == 0 {
+		return fmt.Errorf("anytls: server returned no certificates")
+	}
+	certHash := sha256.Sum256(certs[0].Raw)
+	actualFingerprint := hex.EncodeToString(certHash[:])
+	if actualFingerprint != d.serverCertFingerprint {
+		return fmt.Errorf("anytls: server certificate fingerprint mismatch: expected %s, got %s",
+			d.serverCertFingerprint, actualFingerprint)
+	}
+	return nil
+}
+
+func (d *Dialer) idleSessionManager() {
+	ticker := time.NewTicker(d.idleCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.closed:
+			return
+		case <-ticker.C:
+			d.cleanupIdleSessions()
+		}
+	}
+}
+
+func (d *Dialer) cleanupIdleSessions() {
+	now := time.Now()
+	d.idleSessionLock.Lock()
+	defer d.idleSessionLock.Unlock()
+
+	// Count alive idle sessions
+	alive := 0
+	for _, entry := range d.idleSessions {
+		if !entry.session.closed.Load() {
+			alive++
+		}
+	}
+
+	// Close sessions that have been idle too long, but keep at least minIdleSession
+	for seq, entry := range d.idleSessions {
+		if entry.session.closed.Load() {
+			delete(d.idleSessions, seq)
+			continue
+		}
+		if now.Sub(entry.idleSince) > d.idleTimeout && alive > d.minIdleSession {
+			slog.Debug("[anytls] closing idle session", slog.Uint64("seq", entry.session.seq))
+			entry.session.Close()
+			delete(d.idleSessions, seq)
+			alive--
+		}
+	}
 }

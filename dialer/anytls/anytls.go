@@ -3,7 +3,9 @@ package anytls
 import (
 	"crypto/tls"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -15,14 +17,18 @@ func init() {
 }
 
 type Anytls struct {
-	link              string
-	Name              string
-	Auth              string
-	Host              string
-	Sni               string
-	Insecure          bool
-	ClientFingerprint string   // uTLS client hello fingerprint (e.g. "chrome")
-	Alpn              []string // ALPN protocols (e.g. ["h2"])
+	link                     string
+	Name                     string
+	Auth                     string
+	Host                     string
+	Sni                      string
+	Insecure                 bool
+	ClientFingerprint        string   // uTLS client hello fingerprint (e.g. "chrome")
+	Alpn                     []string // ALPN protocols (e.g. ["h2"])
+	Fingerprint              string   // Server certificate SHA256 fingerprint
+	IdleSessionCheckInterval time.Duration
+	IdleSessionTimeout       time.Duration
+	MinIdleSession           int
 }
 
 func NewAnytls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -65,18 +71,39 @@ func parseAnytlsURL(link string) (*Anytls, error) {
 		alpn = strings.Split(alpnStr, ",")
 	}
 
+	fingerprint := u.Query().Get("fingerprint")
+
+	idleCheckInterval := parseDurationSeconds(u.Query().Get("idle-session-check-interval"))
+	idleTimeout := parseDurationSeconds(u.Query().Get("idle-session-timeout"))
+	minIdleSession, _ := strconv.Atoi(u.Query().Get("min-idle-session"))
+
 	antls := &Anytls{
-		link:              link,
-		Name:              u.Fragment,
-		Auth:              u.User.Username(),
-		Host:              u.Host,
-		Sni:               sni,
-		Insecure:          u.Query().Get("insecure") == "1",
-		ClientFingerprint: clientFingerprint,
-		Alpn:              alpn,
+		link:                     link,
+		Name:                     u.Fragment,
+		Auth:                     u.User.Username(),
+		Host:                     u.Host,
+		Sni:                      sni,
+		Insecure:                 u.Query().Get("insecure") == "1",
+		ClientFingerprint:        clientFingerprint,
+		Alpn:                     alpn,
+		Fingerprint:              fingerprint,
+		IdleSessionCheckInterval: idleCheckInterval,
+		IdleSessionTimeout:       idleTimeout,
+		MinIdleSession:           minIdleSession,
 	}
 
 	return antls, nil
+}
+
+func parseDurationSeconds(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(v) * time.Second
 }
 
 func (s *Anytls) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
@@ -92,11 +119,15 @@ func (s *Anytls) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) 
 		tlsConfig.NextProtos = s.Alpn
 	}
 	d, err := protocol.NewDialer("anytls", nextDialer, protocol.Header{
-		ProxyAddress: s.Host,
-		Password:     s.Auth,
-		IsClient:     true,
-		TlsConfig:    tlsConfig,
-		UtlsImitate:  s.ClientFingerprint,
+		ProxyAddress:             s.Host,
+		Password:                 s.Auth,
+		IsClient:                 true,
+		TlsConfig:                tlsConfig,
+		UtlsImitate:              s.ClientFingerprint,
+		ServerCertFingerprint:    s.Fingerprint,
+		IdleSessionCheckInterval: s.IdleSessionCheckInterval,
+		IdleSessionTimeout:       s.IdleSessionTimeout,
+		MinIdleSession:           s.MinIdleSession,
 	})
 	if err != nil {
 		return nil, nil, err
